@@ -45,7 +45,7 @@ use gpui::{
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     ResizeEdge, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
     WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
-    layer_shell::{Anchor, LayerShellNotSupportedError},
+    layer_shell::{Anchor, KeyboardInteractivity, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
 };
@@ -183,7 +183,10 @@ impl WaylandSurfaceState {
 
             layer_surface.set_anchor(super::layer_shell::wayland_anchor(options.anchor));
             layer_surface.set_keyboard_interactivity(
-                super::layer_shell::wayland_keyboard_interactivity(options.keyboard_interactivity),
+                super::layer_shell::wayland_keyboard_interactivity(
+                    options.keyboard_interactivity,
+                    layer_surface.version(),
+                ),
             );
 
             if let Some(margin) = options.margin {
@@ -475,6 +478,22 @@ impl WaylandSurfaceState {
             self
         {
             layer_surface.set_exclusive_zone(zone);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) -> bool {
+        if let WaylandSurfaceState::LayerShell(WaylandLayerSurfaceState { layer_surface, .. }) =
+            self
+        {
+            layer_surface.set_keyboard_interactivity(
+                super::layer_shell::wayland_keyboard_interactivity(
+                    interactivity,
+                    layer_surface.version(),
+                ),
+            );
             true
         } else {
             false
@@ -2231,6 +2250,18 @@ impl PlatformWindow for WaylandWindow {
     fn set_exclusive_edge(&self, edge: Anchor) {
         let state = self.borrow();
         if state.surface_state.set_exclusive_edge(edge) {
+            // Commit to apply it immediately, otherwise it only takes effect
+            // on the next frame.
+            state.surface.commit();
+        }
+    }
+
+    fn set_keyboard_interactivity(&self, interactivity: KeyboardInteractivity) {
+        let state = self.borrow();
+        if state
+            .surface_state
+            .set_keyboard_interactivity(interactivity)
+        {
             // Commit to apply it immediately, otherwise it only takes effect
             // on the next frame.
             state.surface.commit();
