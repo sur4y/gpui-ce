@@ -21,8 +21,9 @@ use wayland_backend::client::ObjectId;
 use wayland_client::WEnum;
 use wayland_client::{
     Proxy,
-    protocol::{wl_callback, wl_output, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_callback, wl_output, wl_region, wl_seat, wl_shm, wl_surface},
 };
+use wayland_protocols::ext::background_effect::v1::client::ext_background_effect_surface_v1;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -112,6 +113,7 @@ pub struct WaylandWindowState {
     window_min_size: Option<Size<Pixels>>,
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
+    background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -629,6 +631,7 @@ impl WaylandWindowState {
             icon: options.icon,
             generated_icons: Vec::default(),
             blur: None,
+            background_effect: None,
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -829,6 +832,9 @@ impl Drop for WaylandWindow {
         // Destroy blur first, this has no dependencies.
         if let Some(blur) = &state.blur {
             blur.release();
+        }
+        if let Some(background_effect) = state.background_effect.take() {
+            background_effect.destroy();
         }
 
         // Decorations must be destroyed before the xdg state.
@@ -1551,6 +1557,10 @@ impl WaylandWindowStatePtr {
                     .set_destination(f32::from(size.width) as i32, f32::from(size.height) as i32);
             }
         }
+
+        // The opaque and blur regions are sized to the surface, so they need to
+        // be recomputed whenever the window is resized or rescaled.
+        update_window(self.state.borrow_mut());
     }
 
     pub fn resize(&self, size: Size<Pixels>) {
@@ -2388,6 +2398,37 @@ impl accesskit::DeactivationHandler for TrivialDeactivationHandler {
     }
 }
 
+/// The surface-local bounds of the background effect region: the window
+/// content area, with the client-side shadow inset on untiled edges.
+fn blur_region_bounds(bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) -> Bounds<i32> {
+    inset_by_tiling(
+        Bounds {
+            origin: Point::default(),
+            size: bounds.size,
+        },
+        inset,
+        tiling,
+    )
+    .map(|value| f32::from(value) as i32)
+    .map_size(|value| value.max(0))
+}
+
+/// Creates a `wl_region` covering `bounds`, for `set_blur_region` or the KDE
+/// `set_region` request. Temporary regions are destroyed by the caller after
+/// the request has copied their contents.
+fn create_blur_region(globals: &Globals, bounds: Bounds<i32>) -> wl_region::WlRegion {
+    let region = globals.compositor.create_region(&globals.qh, ());
+    if bounds.size.width > 0 && bounds.size.height > 0 {
+        region.add(
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.width,
+            bounds.size.height,
+        );
+    }
+    region
+}
+
 fn update_window(mut state: RefMut<WaylandWindowState>) {
     let opaque = !state.is_transparent();
 
@@ -2417,18 +2458,54 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
         state.surface.set_opaque_region(None);
     }
 
-    if let Some(ref blur_manager) = state.globals.blur_manager {
-        if state.background_appearance == WindowBackgroundAppearance::Blurred {
-            if state.blur.is_none() {
-                let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
-                state.blur = Some(blur);
+    let blurred = state.background_appearance == WindowBackgroundAppearance::Blurred;
+    let blur_bounds = blur_region_bounds(state.bounds, state.inset(), state.tiling);
+
+    // Prefer the cross-compositor ext-background-effect protocol; fall back to
+    // the deprecated KDE blur protocol for compositors that predate it. Only
+    // one mechanism may be active on a surface at a time.
+    if blurred
+        && let Some(background_effect_manager) = state.globals.background_effect_manager.clone()
+    {
+        // Stop the fallback before switching to the ext protocol.
+        if let Some(blur) = state.blur.take() {
+            if let Some(ref blur_manager) = state.globals.blur_manager {
+                blur_manager.unset(&state.surface);
             }
-            state.blur.as_ref().unwrap().commit();
-        } else {
-            // It probably doesn't hurt to clear the blur for opaque windows
-            blur_manager.unset(&state.surface);
-            if let Some(b) = state.blur.take() {
-                b.release()
+            blur.release();
+        }
+
+        if state.background_effect.is_none() {
+            state.background_effect = Some(background_effect_manager.get_background_effect(
+                &state.surface,
+                &state.globals.qh,
+                (),
+            ));
+        }
+
+        let blur_region = create_blur_region(&state.globals, blur_bounds);
+        if let Some(background_effect) = &state.background_effect {
+            background_effect.set_blur_region(Some(&blur_region));
+        }
+        blur_region.destroy();
+    } else {
+        if let Some(background_effect) = state.background_effect.take() {
+            background_effect.destroy();
+        }
+
+        if let Some(ref blur_manager) = state.globals.blur_manager {
+            if blurred {
+                if state.blur.is_none() {
+                    let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
+                    state.blur = Some(blur);
+                }
+                state.blur.as_ref().unwrap().commit();
+            } else {
+                // It probably doesn't hurt to clear the blur for opaque windows
+                blur_manager.unset(&state.surface);
+                if let Some(b) = state.blur.take() {
+                    b.release()
+                }
             }
         }
     }
@@ -2511,4 +2588,141 @@ fn inset_by_tiling(mut bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) ->
     }
 
     bounds
+}
+
+#[cfg(test)]
+mod blur_region_tests {
+    use super::*;
+
+    fn bounds(width: f32, height: f32) -> Bounds<Pixels> {
+        Bounds {
+            origin: Point::default(),
+            size: Size {
+                width: px(width),
+                height: px(height),
+            },
+        }
+    }
+
+    fn region(inset: f32, tiling: Tiling) -> Bounds<i32> {
+        blur_region_bounds(bounds(100.0, 100.0), px(inset), tiling)
+    }
+
+    #[test]
+    fn inset_shrinks_the_region() {
+        assert_eq!(
+            region(10.0, Tiling::default()),
+            Bounds {
+                origin: Point { x: 10, y: 10 },
+                size: Size {
+                    width: 80,
+                    height: 80,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn tiled_edges_are_not_inset() {
+        assert_eq!(
+            region(
+                10.0,
+                Tiling {
+                    top: true,
+                    left: true,
+                    ..Tiling::default()
+                }
+            ),
+            Bounds {
+                origin: Point { x: 0, y: 0 },
+                size: Size {
+                    width: 90,
+                    height: 90,
+                },
+            }
+        );
+        assert_eq!(
+            region(
+                10.0,
+                Tiling {
+                    bottom: true,
+                    right: true,
+                    ..Tiling::default()
+                }
+            ),
+            Bounds {
+                origin: Point { x: 10, y: 10 },
+                size: Size {
+                    width: 90,
+                    height: 90,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn fully_tiled_edges_cover_the_surface() {
+        assert_eq!(
+            region(10.0, Tiling::tiled()),
+            Bounds {
+                origin: Point { x: 0, y: 0 },
+                size: Size {
+                    width: 100,
+                    height: 100,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn region_stays_surface_local_and_non_negative() {
+        let surface = bounds(50.0, 30.0);
+        let tilings = [
+            Tiling::default(),
+            Tiling::tiled(),
+            Tiling {
+                top: true,
+                ..Tiling::default()
+            },
+            Tiling {
+                bottom: true,
+                ..Tiling::default()
+            },
+            Tiling {
+                left: true,
+                ..Tiling::default()
+            },
+            Tiling {
+                right: true,
+                ..Tiling::default()
+            },
+        ];
+
+        for tiling in tilings {
+            for inset in [0.0, 5.0, 20.0, 100.0] {
+                let region = blur_region_bounds(surface, px(inset), tiling);
+                assert!(region.size.width >= 0 && region.size.height >= 0);
+                if region.size.width > 0 {
+                    assert!(region.origin.x >= 0);
+                    assert!(region.origin.x + region.size.width <= 50);
+                }
+                if region.size.height > 0 {
+                    assert!(region.origin.y >= 0);
+                    assert!(region.origin.y + region.size.height <= 30);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oversized_inset_yields_an_empty_region() {
+        let region = blur_region_bounds(bounds(5.0, 5.0), px(10.0), Tiling::default());
+        assert_eq!(
+            region.size,
+            Size {
+                width: 0,
+                height: 0,
+            }
+        );
+    }
 }
