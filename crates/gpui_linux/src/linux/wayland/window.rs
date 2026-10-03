@@ -2493,12 +2493,22 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
             background_effect.destroy();
         }
 
+        // The deprecated KDE blur protocol is kept as a fallback for
+        // compositors that predate ext-background-effect. KWin removed its
+        // global in Plasma 6.7
+        // (https://invent.kde.org/plasma/kwin/-/commit/7f9e0aa1cd2c2ab4fea1097800893b6f780089eb),
+        // so this can be deleted once no supported compositor ships it. See
+        // https://github.com/zed-industries/zed/pull/53746 for the upstream
+        // discussion that kept it.
         if let Some(ref blur_manager) = state.globals.blur_manager {
             if blurred {
                 if state.blur.is_none() {
                     let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
                     state.blur = Some(blur);
                 }
+                let blur_region = create_blur_region(&state.globals, blur_bounds);
+                state.blur.as_ref().unwrap().set_region(Some(&blur_region));
+                blur_region.destroy();
                 state.blur.as_ref().unwrap().commit();
             } else {
                 // It probably doesn't hurt to clear the blur for opaque windows
