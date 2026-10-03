@@ -42,7 +42,7 @@ pub(crate) type PlatformScreenCaptureFrame = ();
 
 use crate::util::FluentBuilder;
 use crate::{
-    Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
+    Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds, Corners,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
     FontId, FontMetrics, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, InlineLayout,
     InlineLayoutRequest, Keymap, LineLayout, Pixels, PlatformGestures, PlatformInput, Point,
@@ -993,6 +993,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     #[cfg(all(target_os = "linux", feature = "wayland"))]
     fn set_exclusive_edge(&self, _edge: layer_shell::Anchor) {}
     fn set_input_region(&self, _region: Option<&[Bounds<Pixels>]>) {}
+    /// Set the corner geometry used to shape the Wayland background effect
+    /// region. The default implementation does nothing for platforms that do
+    /// not use it.
+    fn set_corner_radii(&self, _corner_radii: Corners<Pixels>) {}
     fn window_decorations(&self) -> Decorations {
         Decorations::Server
     }
@@ -2584,6 +2588,18 @@ pub struct WindowOptions {
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     pub linux_window_background: LinuxWindowBackground,
 
+    /// The window's corner geometry, used to shape the Wayland background
+    /// effect region.
+    ///
+    /// This does not clip or render the window itself, does not modify input
+    /// regions, and currently only affects the compositor's blur region. On
+    /// Wayland the region is rounded only for client-side decorations, where
+    /// GPUI controls the visible corner shape; server-side decorations keep
+    /// their compositor-provided frame. Corners adjacent to tiled edges are
+    /// squared automatically. Ignored by backends other than Wayland.
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub linux_window_corner_radii: Corners<Pixels>,
+
     /// The background appearance of a web window.
     #[cfg(target_family = "wasm")]
     pub web_window_background: WebWindowBackground,
@@ -2732,6 +2748,8 @@ impl Default for WindowOptions {
             windows_window_background: WindowsWindowBackground::default(),
             #[cfg(any(target_os = "linux", target_os = "freebsd"))]
             linux_window_background: LinuxWindowBackground::default(),
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            linux_window_corner_radii: Corners::default(),
             #[cfg(target_family = "wasm")]
             web_window_background: WebWindowBackground::default(),
             icon: None,

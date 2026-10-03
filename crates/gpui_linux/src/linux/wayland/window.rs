@@ -40,11 +40,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
-    AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload, GpuSpecs,
-    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    AnyWindowHandle, Bounds, Capslock, Corners, Decorations, DevicePixels, ExternalDragPayload,
+    GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -114,6 +114,7 @@ pub struct WaylandWindowState {
     appearance: WindowAppearance,
     blur: Option<org_kde_kwin_blur::OrgKdeKwinBlur>,
     background_effect: Option<ext_background_effect_surface_v1::ExtBackgroundEffectSurfaceV1>,
+    corner_radii: Corners<Pixels>,
     viewport: Option<wp_viewport::WpViewport>,
     outputs: HashMap<ObjectId, Output>,
     display: Option<(ObjectId, Output)>,
@@ -632,6 +633,7 @@ impl WaylandWindowState {
             generated_icons: Vec::default(),
             blur: None,
             background_effect: None,
+            corner_radii: Corners::default(),
             viewport,
             globals,
             outputs: HashMap::default(),
@@ -1992,6 +1994,16 @@ impl PlatformWindow for WaylandWindow {
         self.0.request_redraw();
     }
 
+    fn set_corner_radii(&self, corner_radii: Corners<Pixels>) {
+        let mut state = self.borrow_mut();
+        if state.corner_radii == corner_radii {
+            return;
+        }
+        state.corner_radii = corner_radii;
+        update_window(state);
+        self.0.request_redraw();
+    }
+
     fn background_appearance(&self) -> WindowBackgroundAppearance {
         self.borrow().background_appearance
     }
@@ -2413,17 +2425,164 @@ fn blur_region_bounds(bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) -> 
     .map_size(|value| value.max(0))
 }
 
-/// Creates a `wl_region` covering `bounds`, for `set_blur_region` or the KDE
-/// `set_region` request. Temporary regions are destroyed by the caller after
-/// the request has copied their contents.
-fn create_blur_region(globals: &Globals, bounds: Bounds<i32>) -> wl_region::WlRegion {
+/// Zeroes the corners whose adjacent edges are tiled, matching how GPUI rounds
+/// client-side window decorations.
+fn tiled_corner_radii(mut corner_radii: Corners<Pixels>, tiling: Tiling) -> Corners<Pixels> {
+    if tiling.top || tiling.left {
+        corner_radii.top_left = px(0.0);
+    }
+    if tiling.top || tiling.right {
+        corner_radii.top_right = px(0.0);
+    }
+    if tiling.bottom || tiling.right {
+        corner_radii.bottom_right = px(0.0);
+    }
+    if tiling.bottom || tiling.left {
+        corner_radii.bottom_left = px(0.0);
+    }
+    corner_radii
+}
+
+/// The horizontal inset of a rounded corner on the scanline `row` rows from
+/// the edge it belongs to, sampling the vertical center of the pixel.
+fn corner_inset(radius: i32, row: i32) -> i32 {
+    let radius = f64::from(radius);
+    let dy = radius - (f64::from(row) + 0.5);
+    let half_chord = (radius * radius - dy * dy).max(0.0).sqrt();
+    (radius - half_chord - 0.5).ceil().max(0.0) as i32
+}
+
+/// Clamps per-corner radii to the surface and converts them to integer pixels.
+fn clamp_corner_radii(bounds: Bounds<i32>, corner_radii: Corners<Pixels>) -> Corners<i32> {
+    corner_radii
+        .clamp_radii_for_quad_size(Size {
+            width: px(bounds.size.width as f32),
+            height: px(bounds.size.height as f32),
+        })
+        .map(|radius| f32::from(*radius) as i32)
+        .map(|radius| (*radius).max(0))
+}
+
+/// Returns the rectangles that approximate `bounds` with its corners rounded
+/// by `corner_radii`, in surface-local coordinates.
+///
+/// Every scanline combines all four corner constraints before its span is
+/// emitted, so asymmetric radii whose corner bands overlap vertically cannot
+/// union each other's cuts away. Consecutive scanlines with the same span are
+/// coalesced into taller rectangles to keep the number of `wl_region.add`
+/// requests down.
+///
+/// Wayland regions are unions of integer rectangles, so each scanline of a
+/// corner band is sampled at the vertical center of its pixel, matching how
+/// GPUI renders rounded geometry. This is an approximation, not antialiasing.
+fn rounded_region_rects(bounds: Bounds<i32>, corner_radii: Corners<i32>) -> Vec<Bounds<i32>> {
+    if bounds.size.width <= 0 || bounds.size.height <= 0 {
+        return Vec::new();
+    }
+
+    let Corners {
+        top_left,
+        top_right,
+        bottom_right,
+        bottom_left,
+    } = corner_radii;
+
+    let x = bounds.origin.x;
+    let y = bounds.origin.y;
+    let width = bounds.size.width;
+    let height = bounds.size.height;
+
+    let mut rects = Vec::new();
+    // The span that is currently being coalesced: (x, width, first row).
+    let mut pending: Option<(i32, i32, i32)> = None;
+
+    for row in 0..height {
+        let from_bottom = height - row - 1;
+
+        let left = if row < top_left {
+            corner_inset(top_left, row)
+        } else {
+            0
+        }
+        .max(if from_bottom < bottom_left {
+            corner_inset(bottom_left, from_bottom)
+        } else {
+            0
+        });
+
+        let right = if row < top_right {
+            corner_inset(top_right, row)
+        } else {
+            0
+        }
+        .max(if from_bottom < bottom_right {
+            corner_inset(bottom_right, from_bottom)
+        } else {
+            0
+        });
+
+        let span_x = x + left;
+        let span_width = width - left - right;
+
+        match pending {
+            Some((pending_x, pending_width, _))
+                if pending_x == span_x && pending_width == span_width => {}
+            Some((pending_x, pending_width, start)) => {
+                rects.push(Bounds {
+                    origin: Point {
+                        x: pending_x,
+                        y: y + start,
+                    },
+                    size: Size {
+                        width: pending_width,
+                        height: row - start,
+                    },
+                });
+                pending = (span_width > 0).then_some((span_x, span_width, row));
+            }
+            None => {
+                pending = (span_width > 0).then_some((span_x, span_width, row));
+            }
+        }
+    }
+
+    if let Some((pending_x, pending_width, start)) = pending {
+        rects.push(Bounds {
+            origin: Point {
+                x: pending_x,
+                y: y + start,
+            },
+            size: Size {
+                width: pending_width,
+                height: height - start,
+            },
+        });
+    }
+
+    if rects.is_empty() {
+        // A very small surface can round away entirely. Keep the region
+        // non-empty so the background effect still applies.
+        rects.push(bounds);
+    }
+
+    rects
+}
+
+/// Creates a `wl_region` covering `bounds`, rounded by `corner_radii`, for
+/// `set_blur_region` or the KDE `set_region` request. Temporary regions are
+/// destroyed by the caller after the request has copied their contents.
+fn create_blur_region(
+    globals: &Globals,
+    bounds: Bounds<i32>,
+    corner_radii: Corners<Pixels>,
+) -> wl_region::WlRegion {
     let region = globals.compositor.create_region(&globals.qh, ());
-    if bounds.size.width > 0 && bounds.size.height > 0 {
+    for rect in rounded_region_rects(bounds, clamp_corner_radii(bounds, corner_radii)) {
         region.add(
-            bounds.origin.x,
-            bounds.origin.y,
-            bounds.size.width,
-            bounds.size.height,
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
         );
     }
     region
@@ -2460,6 +2619,13 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
 
     let blurred = state.background_appearance == WindowBackgroundAppearance::Blurred;
     let blur_bounds = blur_region_bounds(state.bounds, state.inset(), state.tiling);
+    // Client-side decorations are the only case where the app controls the
+    // visible corner shape; server-side frames are drawn by the compositor.
+    let corner_radii = if state.decorations == WindowDecorations::Client {
+        tiled_corner_radii(state.corner_radii, state.tiling)
+    } else {
+        Corners::default()
+    };
 
     // Prefer the cross-compositor ext-background-effect protocol; fall back to
     // the deprecated KDE blur protocol for compositors that predate it. Only
@@ -2483,7 +2649,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
             ));
         }
 
-        let blur_region = create_blur_region(&state.globals, blur_bounds);
+        let blur_region = create_blur_region(&state.globals, blur_bounds, corner_radii);
         if let Some(background_effect) = &state.background_effect {
             background_effect.set_blur_region(Some(&blur_region));
         }
@@ -2506,7 +2672,7 @@ fn update_window(mut state: RefMut<WaylandWindowState>) {
                     let blur = blur_manager.create(&state.surface, &state.globals.qh, ());
                     state.blur = Some(blur);
                 }
-                let blur_region = create_blur_region(&state.globals, blur_bounds);
+                let blur_region = create_blur_region(&state.globals, blur_bounds, corner_radii);
                 state.blur.as_ref().unwrap().set_region(Some(&blur_region));
                 blur_region.destroy();
                 state.blur.as_ref().unwrap().commit();
@@ -2734,5 +2900,367 @@ mod blur_region_tests {
                 height: 0,
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod rounded_region_tests {
+    use super::*;
+
+    fn bounds(width: i32, height: i32) -> Bounds<i32> {
+        Bounds {
+            origin: Point { x: 0, y: 0 },
+            size: Size { width, height },
+        }
+    }
+
+    fn radii(all: f32) -> Corners<Pixels> {
+        Corners::from(px(all))
+    }
+
+    fn radii_i32(all: i32) -> Corners<i32> {
+        Corners {
+            top_left: all,
+            top_right: all,
+            bottom_right: all,
+            bottom_left: all,
+        }
+    }
+
+    fn contains(rects: &[Bounds<i32>], x: i32, y: i32) -> bool {
+        rects.iter().any(|rect| {
+            x >= rect.origin.x
+                && x < rect.origin.x + rect.size.width
+                && y >= rect.origin.y
+                && y < rect.origin.y + rect.size.height
+        })
+    }
+
+    fn assert_valid(rects: &[Bounds<i32>], bounds: Bounds<i32>) {
+        for rect in rects {
+            assert!(
+                rect.size.width > 0 && rect.size.height > 0,
+                "empty rect: {rects:?}"
+            );
+            assert!(
+                rect.origin.x >= bounds.origin.x
+                    && rect.origin.y >= bounds.origin.y
+                    && rect.origin.x + rect.size.width <= bounds.origin.x + bounds.size.width
+                    && rect.origin.y + rect.size.height <= bounds.origin.y + bounds.size.height,
+                "rect outside bounds: {rects:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_radii_cover_the_whole_bounds() {
+        assert_eq!(
+            rounded_region_rects(bounds(10, 20), Corners::default()),
+            vec![bounds(10, 20)]
+        );
+    }
+
+    #[test]
+    fn equal_radii_round_all_corners() {
+        let bounds = bounds(10, 10);
+        let rects = rounded_region_rects(bounds, radii_i32(3));
+
+        assert!(!contains(&rects, 0, 0));
+        assert!(!contains(&rects, 9, 0));
+        assert!(!contains(&rects, 0, 9));
+        assert!(!contains(&rects, 9, 9));
+        assert!(contains(&rects, 5, 0));
+        assert!(contains(&rects, 0, 5));
+        assert!(contains(&rects, 5, 5));
+        assert!(contains(&rects, 9, 5));
+    }
+
+    #[test]
+    fn different_radius_per_corner() {
+        let bounds = bounds(8, 8);
+        let rects = rounded_region_rects(
+            bounds,
+            Corners {
+                top_left: 1,
+                top_right: 2,
+                bottom_right: 3,
+                bottom_left: 4,
+            },
+        );
+
+        // A radius of one rounds nothing at this resolution; larger radii cut
+        // progressively more.
+        assert!(contains(&rects, 0, 0));
+        assert!(!contains(&rects, 7, 0));
+        assert!(!contains(&rects, 7, 7));
+        assert!(!contains(&rects, 0, 7));
+        assert!(contains(&rects, 3, 3));
+    }
+
+    #[test]
+    fn crossing_asymmetric_radii_keep_both_cuts() {
+        let bounds = bounds(20, 10);
+        let rects = rounded_region_rects(
+            bounds,
+            Corners {
+                top_left: 8,
+                top_right: 0,
+                bottom_right: 8,
+                bottom_left: 0,
+            },
+        );
+
+        // The top-left cut must survive inside the vertical overlap with the
+        // bottom corner band.
+        assert!(!contains(&rects, 0, 2));
+        assert!(!contains(&rects, 1, 2));
+        assert!(contains(&rects, 2, 2));
+
+        // ... and the bottom-right cut must survive too.
+        assert!(!contains(&rects, 19, 7));
+        assert!(!contains(&rects, 18, 7));
+        assert!(contains(&rects, 17, 7));
+    }
+
+    #[test]
+    fn crossing_asymmetric_radii_opposite_diagonal() {
+        let bounds = bounds(20, 10);
+        let rects = rounded_region_rects(
+            bounds,
+            Corners {
+                top_left: 0,
+                top_right: 8,
+                bottom_right: 0,
+                bottom_left: 8,
+            },
+        );
+
+        assert!(!contains(&rects, 19, 2));
+        assert!(!contains(&rects, 18, 2));
+        assert!(contains(&rects, 17, 2));
+        assert!(!contains(&rects, 0, 7));
+        assert!(!contains(&rects, 1, 7));
+        assert!(contains(&rects, 2, 7));
+    }
+
+    #[test]
+    fn scanlines_combine_all_active_corner_constraints() {
+        let bounds = bounds(20, 10);
+        let radii = Corners {
+            top_left: 8,
+            top_right: 3,
+            bottom_right: 8,
+            bottom_left: 3,
+        };
+        let rects = rounded_region_rects(bounds, radii);
+
+        for row in 0..10 {
+            let from_bottom = 9 - row;
+            let left = if row < 8 { corner_inset(8, row) } else { 0 }.max(if from_bottom < 3 {
+                corner_inset(3, from_bottom)
+            } else {
+                0
+            });
+            let right = if row < 3 { corner_inset(3, row) } else { 0 }.max(if from_bottom < 8 {
+                corner_inset(8, from_bottom)
+            } else {
+                0
+            });
+
+            if left > 0 {
+                assert!(!contains(&rects, left - 1, row), "row {row} left cut");
+            }
+            if right > 0 {
+                assert!(!contains(&rects, 20 - right, row), "row {row} right cut");
+            }
+            if left + right < 20 {
+                assert!(contains(&rects, left, row), "row {row} left edge");
+                assert!(contains(&rects, 19 - right, row), "row {row} right edge");
+            }
+        }
+    }
+
+    #[test]
+    fn tiled_edges_square_the_adjacent_corners() {
+        assert_eq!(
+            tiled_corner_radii(
+                radii(4.0),
+                Tiling {
+                    top: true,
+                    ..Tiling::default()
+                }
+            ),
+            Corners {
+                top_left: px(0.0),
+                top_right: px(0.0),
+                bottom_right: px(4.0),
+                bottom_left: px(4.0),
+            }
+        );
+        assert_eq!(
+            tiled_corner_radii(
+                radii(4.0),
+                Tiling {
+                    left: true,
+                    ..Tiling::default()
+                }
+            ),
+            Corners {
+                top_left: px(0.0),
+                top_right: px(4.0),
+                bottom_right: px(4.0),
+                bottom_left: px(0.0),
+            }
+        );
+        assert_eq!(
+            tiled_corner_radii(
+                radii(4.0),
+                Tiling {
+                    right: true,
+                    ..Tiling::default()
+                }
+            ),
+            Corners {
+                top_left: px(4.0),
+                top_right: px(0.0),
+                bottom_right: px(0.0),
+                bottom_left: px(4.0),
+            }
+        );
+        assert_eq!(
+            tiled_corner_radii(
+                radii(4.0),
+                Tiling {
+                    bottom: true,
+                    ..Tiling::default()
+                }
+            ),
+            Corners {
+                top_left: px(4.0),
+                top_right: px(4.0),
+                bottom_right: px(0.0),
+                bottom_left: px(0.0),
+            }
+        );
+        assert_eq!(
+            tiled_corner_radii(radii(4.0), Tiling::tiled()),
+            Corners::default()
+        );
+    }
+
+    #[test]
+    fn tiled_corners_do_not_round() {
+        let bounds = bounds(8, 8);
+        let rects = rounded_region_rects(
+            bounds,
+            clamp_corner_radii(
+                bounds,
+                tiled_corner_radii(
+                    radii(3.0),
+                    Tiling {
+                        top: true,
+                        ..Tiling::default()
+                    },
+                ),
+            ),
+        );
+
+        assert!(contains(&rects, 0, 0));
+        assert!(contains(&rects, 7, 0));
+        assert!(!contains(&rects, 0, 7));
+    }
+
+    #[test]
+    fn clamps_radii_to_half_the_shortest_side() {
+        let bounds = bounds(10, 4);
+        assert_eq!(clamp_corner_radii(bounds, radii(100.0)), radii_i32(2));
+        assert_eq!(clamp_corner_radii(bounds, radii(f32::MAX)), radii_i32(2));
+        assert_eq!(clamp_corner_radii(bounds, radii(-5.0)), radii_i32(0));
+    }
+
+    #[test]
+    fn pixel_center_sampling_shape_at_small_radii() {
+        // With radius 2 on a 4x4 surface the outer scanline of each corner
+        // band is inset by one pixel and the inner scanlines coalesce.
+        assert_eq!(
+            rounded_region_rects(bounds(4, 4), radii_i32(2)),
+            vec![
+                Bounds {
+                    origin: Point { x: 1, y: 0 },
+                    size: Size {
+                        width: 2,
+                        height: 1,
+                    },
+                },
+                Bounds {
+                    origin: Point { x: 0, y: 1 },
+                    size: Size {
+                        width: 4,
+                        height: 2,
+                    },
+                },
+                Bounds {
+                    origin: Point { x: 1, y: 3 },
+                    size: Size {
+                        width: 2,
+                        height: 1,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn handles_tiny_and_invalid_bounds() {
+        assert!(rounded_region_rects(bounds(0, 10), radii_i32(5)).is_empty());
+        assert!(rounded_region_rects(bounds(10, 0), radii_i32(5)).is_empty());
+        assert!(rounded_region_rects(bounds(-1, 10), radii_i32(5)).is_empty());
+
+        for width in 1..=3 {
+            for height in 1..=3 {
+                for radius in [0, 1, 2, 100] {
+                    let bounds = bounds(width, height);
+                    let rects = rounded_region_rects(bounds, radii_i32(radius));
+                    assert!(!rects.is_empty(), "no rects for {width}x{height} r{radius}");
+                    assert_valid(&rects, bounds);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rects_stay_inside_bounds_for_every_tiling() {
+        let surface = bounds(20, 12);
+        let tilings = [
+            Tiling::default(),
+            Tiling::tiled(),
+            Tiling {
+                top: true,
+                ..Tiling::default()
+            },
+            Tiling {
+                bottom: true,
+                ..Tiling::default()
+            },
+            Tiling {
+                left: true,
+                ..Tiling::default()
+            },
+            Tiling {
+                right: true,
+                ..Tiling::default()
+            },
+        ];
+
+        for tiling in tilings {
+            for radius in [0.0, 1.0, 3.0, 6.0, 100.0] {
+                let rects = rounded_region_rects(
+                    surface,
+                    clamp_corner_radii(surface, tiled_corner_radii(radii(radius), tiling)),
+                );
+                assert!(!rects.is_empty());
+                assert_valid(&rects, surface);
+            }
+        }
     }
 }

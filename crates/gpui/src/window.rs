@@ -1500,6 +1500,8 @@ impl Window {
                 allow(unused_variables)
             )]
             icon,
+            #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+            linux_window_corner_radii,
             #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
             tabbing_identifier,
             ..
@@ -1556,6 +1558,8 @@ impl Window {
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        platform_window.set_corner_radii(linux_window_corner_radii);
         platform_window.set_background_appearance(background_appearance);
 
         match window_bounds {
@@ -2428,6 +2432,18 @@ impl Window {
     /// - `None` resets the region to the default, so the whole window receives input again.
     pub fn set_input_region(&self, region: Option<&[Bounds<Pixels>]>) {
         self.platform_window.set_input_region(region);
+    }
+
+    /// Linux (Wayland) only: set the window's corner geometry, which shapes the
+    /// compositor's blur region so it does not bleed past rounded corners.
+    ///
+    /// This does not clip or render the window itself, does not modify input
+    /// regions, and only affects the background effect region. Rounded geometry
+    /// is applied only with client-side decorations, where GPUI controls the
+    /// visible corner shape; corners adjacent to tiled edges are squared
+    /// automatically.
+    pub fn set_corner_radii(&self, corner_radii: impl Into<Corners<Pixels>>) {
+        self.platform_window.set_corner_radii(corner_radii.into());
     }
 
     /// Return the `WindowBounds` to indicate that how a window should be opened
